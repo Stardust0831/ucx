@@ -732,44 +732,29 @@ uct_cuda_ipc_cache_put_region(uct_cuda_ipc_cache_t *cache,
             region->refcount++;
             pthread_rwlock_unlock(&cache->lock);
             return UCS_OK;
-        } else {
-            ucs_trace("%s: cuda_ipc cache remove stale region:"
-                      UCS_PGT_REGION_FMT " new_addr:%p new_size:%lu",
-                      cache->name, UCS_PGT_REGION_ARG(&region->super),
-                      (void *)key->d_bptr, key->b_len);
-
-            uct_cuda_ipc_cache_region_destroy(cache, region);
         }
     }
+
+    /* A new allocation can start below a stale cached region, so a point
+     * lookup can miss a mapping that would conflict with the import. */
+    uct_cuda_ipc_cache_invalidate_regions(
+            cache, (void *)key->d_bptr,
+            UCS_PTR_BYTE_OFFSET(key->d_bptr, key->b_len));
 
     status = uct_cuda_ipc_open_memhandle(ext_key, cu_dev,
                                          (CUdeviceptr*)mapped_addr, log_level);
     if (ucs_unlikely(status != UCS_OK)) {
         if (ucs_likely(status == UCS_ERR_ALREADY_EXISTS)) {
-            /* unmap all overlapping regions and retry*/
-            uct_cuda_ipc_cache_invalidate_regions(cache, (void *)key->d_bptr,
-                                                  UCS_PTR_BYTE_OFFSET(key->d_bptr,
-                                                                      key->b_len));
+            /* A remaining mapping conflict may lie outside the advertised
+             * range, so recovery requires purging the entire cache. */
+            uct_cuda_ipc_cache_purge(cache, 1);
             status = uct_cuda_ipc_open_memhandle(ext_key, cu_dev,
                                                  (CUdeviceptr*)mapped_addr,
                                                  log_level);
             if (ucs_unlikely(status != UCS_OK)) {
-                if (ucs_likely(status == UCS_ERR_ALREADY_EXISTS)) {
-                    /* unmap all cache entries and retry */
-                    uct_cuda_ipc_cache_purge(cache, 1);
-                    status = uct_cuda_ipc_open_memhandle(
-                            ext_key, cu_dev, (CUdeviceptr*)mapped_addr,
-                            log_level);
-                    if (status != UCS_OK) {
-                        ucs_fatal("%s: failed to open ipc mem handle. addr:%p "
-                                  "len:%lu (%s)", cache->name,
-                                  (void *)key->d_bptr, key->b_len,
-                                  ucs_status_string(status));
-                    }
-                } else {
-                    ucs_fatal("%s: failed to open ipc mem handle. addr:%p len:%lu",
-                              cache->name, (void *)key->d_bptr, key->b_len);
-                }
+                ucs_fatal("%s: failed to open ipc mem handle. addr:%p "
+                          "len:%lu (%s)", cache->name, (void *)key->d_bptr,
+                          key->b_len, ucs_status_string(status));
             }
         } else {
             ucs_debug("%s: failed to open ipc mem handle. addr:%p len:%lu",
@@ -800,14 +785,6 @@ uct_cuda_ipc_cache_put_region(uct_cuda_ipc_cache_t *cache,
 
     status = UCS_PROFILE_CALL(ucs_pgtable_insert,
                               &cache->pgtable, &region->super);
-    if (status == UCS_ERR_ALREADY_EXISTS) {
-        /* overlapped region means memory freed at source. remove and try insert */
-        uct_cuda_ipc_cache_invalidate_regions(cache,
-                                              (void *)region->super.start,
-                                              (void *)region->super.end);
-        status = UCS_PROFILE_CALL(ucs_pgtable_insert,
-                                  &cache->pgtable, &region->super);
-    }
     if (status != UCS_OK) {
 
         ucs_error("%s: failed to insert region:"UCS_PGT_REGION_FMT" size:%lu :%s",
